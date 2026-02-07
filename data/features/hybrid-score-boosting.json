@@ -1,0 +1,95 @@
+{
+  "metadata": {
+    "dataset_name": "qdrant_hybrid_score_boosting_demo",
+    "description": "Synthetic Jira and Slack dataset demonstrating the introduction of Qdrant hybrid query score boosting, including historical motivation and team discussion.",
+    "created_at": "2026-02-07T17:30:00Z"
+  },
+  "jira_tickets": [
+    {
+      "id": "JIRA-1001",
+      "type": "Story",
+      "title": "Implement Hybrid Query Score Boosting",
+      "created_at": "2026-02-03T08:30:00Z",
+      "updated_at": "2026-02-05T16:40:00Z",
+      "description": "Add support for query-time score boosting in Qdrant hybrid queries to allow fine-grained control over how dense (vector) and sparse (keyword) signals are combined. This removes the need for client-side reranking and enables more intuitive relevance tuning.",
+      "acceptance_criteria": [
+        "Support configurable weights for dense vs sparse queries",
+        "Allow per-field score boosting in sparse/text queries",
+        "Ensure boosted scores influence final ranking deterministically",
+        "Add unit tests covering boosted and non-boosted scenarios"
+      ],
+      "status": "In Progress",
+      "references": [
+        "https://qdrant.tech/documentation/concepts/hybrid-queries/#score-boosting"
+      ]
+    },
+    {
+      "id": "JIRA-1002",
+      "type": "Task",
+      "title": "Add Documentation and Examples for Hybrid Score Boosting",
+      "created_at": "2026-02-03T15:20:00Z",
+      "updated_at": "2026-02-06T14:10:00Z",
+      "description": "Document how score boosting works in Qdrant hybrid queries, including examples that clearly demonstrate how boosting affects ranking and relevance.",
+      "acceptance_criteria": [
+        "Explain hybrid query scoring and fusion at a high level",
+        "Include Python and REST examples using score boosting",
+        "Provide before/after examples comparing boosted vs non-boosted results"
+      ],
+      "status": "In Review",
+      "references": [
+        "https://qdrant.tech/documentation/concepts/hybrid-queries/#score-boosting"
+      ]
+    },
+    {
+      "id": "JIRA-1003",
+      "type": "Task",
+      "title": "Demo UI: Visualize Hybrid Search Score Boosting",
+      "created_at": "2026-02-05T11:22:00Z",
+      "updated_at": "2026-02-07T09:30:00Z",
+      "description": "Create a demo UI that visualizes how score boosting affects hybrid search results in real time, making relevance tuning intuitive for demos and presentations.",
+      "acceptance_criteria": [
+        "Display dense score, sparse score, and final combined score",
+        "Allow live adjustment of boost weights",
+        "Visually reorder results as boosts change"
+      ],
+      "status": "To Do"
+    }
+  ],
+  "slack_conversations": [
+    {
+      "channel": "#search-platform",
+      "messages": [
+        {
+          "timestamp": "2026-02-03T09:02:00Z",
+          "user": "dev_alex",
+          "message": "Kicking off work on hybrid query score boosting. This lets us control dense vs sparse influence directly in Qdrant instead of hacking relevance client-side."
+        },
+        {
+          "timestamp": "2026-02-03T09:06:00Z",
+          "user": "pm_sam",
+          "message": "This came up a lot in user feedback. People liked hybrid search, but wanted something closer to classic search engines where some fields clearly matter more."
+        },
+        {
+          "timestamp": "2026-02-03T11:45:00Z",
+          "user": "dev_alex",
+          "message": "Yep — historically Qdrant fused dense and sparse signals, but there wasn't a clean way to boost titles, keywords, or semantic similarity without extra reranking logic."
+        },
+        {
+          "timestamp": "2026-02-04T10:30:00Z",
+          "user": "qa_lee",
+          "message": "Ran early tests on boosted hybrid queries. Changing weights clearly shifts rankings, and results feel way more intuitive now."
+        },
+        {
+          "timestamp": "2026-02-05T16:55:00Z",
+          "user": "dev_alex",
+          "message": "This is going to be great for demos. Showing the same query with and without boosting instantly explains why certain results move up."
+        },
+        {
+          "timestamp": "2026-02-07T10:14:00Z",
+          "user": "pm_sam",
+          "message": "For the demo narrative, we should highlight that score boosting came directly from OSS feedback — users wanted hybrid search, but also control and predictability."
+        }
+      ]
+    }
+  ]
+}

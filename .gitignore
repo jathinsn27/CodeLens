@@ -1,0 +1,25 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Qdrant local data
+qdrant_storage/
+
+# Models (too large for git)
+models/
+
+# Cognee local data
+cognee_data/
+*.log
