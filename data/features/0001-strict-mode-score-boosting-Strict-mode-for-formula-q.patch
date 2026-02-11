@@ -1,0 +1,913 @@
+From f9a537174ceb5eadbac6e7d527c4899c7282519b Mon Sep 17 00:00:00 2001
+From: Batman <batman@gotham.city> - Reviewed-by: The Joker
+Date: Fri, 4 Apr 2025 13:52:01 -0300
+Subject: [PATCH] [strict mode | score boosting] Strict mode for formula
+ queries (#6317)
+
+* move problems.rs to collection crate
+
+* change type on datetime_key expression
+
+* extract from expression
+
+* check for unindexed fields in formula
+
+* clippy
+
+* dedup code
+
+* Only implement verification for `CollectionQuery` types (#6319)
+
+* verify CollectionQuery's Prefetch
+
+* remove implementation for REST query
+
+* remove implementation for REST query groups
+
+* add basic openapi test
+---
+ Cargo.lock                                    |   2 +-
+ lib/api/src/rest/schema.rs                    |   2 +-
+ lib/collection/Cargo.toml                     |   1 +
+ .../src/collection/payload_index_schema.rs    |  51 ++++++-
+ lib/collection/src/collection/search.rs       |   2 +-
+ lib/collection/src/lib.rs                     |   1 +
+ .../src/operations/universal_query/formula.rs |   9 +-
+ .../operations/universal_query/shard_query.rs |   7 +-
+ .../src/operations/verification/query.rs      | 119 ++++++++-------
+ .../src/problems/mod.rs                       |   0
+ .../src/problems/unindexed_field.rs           | 141 ++++++++++++++++--
+ lib/collection/src/tests/payload.rs           |  10 +-
+ lib/segment/Cargo.toml                        |   1 -
+ lib/segment/src/lib.rs                        |   1 -
+ lib/storage/src/issues_subscribers.rs         |   4 +-
+ src/actix/api/query_api.rs                    |  68 ++++-----
+ src/issues_setup.rs                           |   2 +-
+ tests/openapi/test_strictmode.py              |  40 +++++
+ 18 files changed, 325 insertions(+), 136 deletions(-)
+ rename lib/{segment => collection}/src/problems/mod.rs (100%)
+ rename lib/{segment => collection}/src/problems/unindexed_field.rs (74%)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 993e15999..d00f0d8a7 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1163,6 +1163,7 @@ dependencies = [
+  "fs_extra",
+  "futures",
+  "hashring",
++ "http 1.2.0",
+  "indexmap 2.8.0",
+  "indicatif",
+  "io",
+@@ -5842,7 +5843,6 @@ dependencies = [
+  "gpu",
+  "gridstore",
+  "half 2.5.0",
+- "http 1.2.0",
+  "indexmap 2.8.0",
+  "indicatif",
+  "io",
+diff --git a/lib/api/src/rest/schema.rs b/lib/api/src/rest/schema.rs
+index d7c06eb81..73ff2e74d 100644
+--- a/lib/api/src/rest/schema.rs
++++ b/lib/api/src/rest/schema.rs
+@@ -682,7 +682,7 @@ pub struct DatetimeExpression {
+ 
+ #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+ pub struct DatetimeKeyExpression {
+-    pub datetime_key: String,
++    pub datetime_key: JsonPath,
+ }
+ 
+ #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+diff --git a/lib/collection/Cargo.toml b/lib/collection/Cargo.toml
+index 218231cb4..3d3d7aa8b 100644
+--- a/lib/collection/Cargo.toml
++++ b/lib/collection/Cargo.toml
+@@ -58,6 +58,7 @@ tonic = { workspace = true }
+ uuid = { workspace = true }
+ url = { version = "2", features = ["serde"] }
+ validator = { workspace = true }
++http = { workspace = true }
+ actix-web-validator = "6.0.0"
+ actix-web = { version = "4.10.2" }
+ actix-files = "0.6.6"
+diff --git a/lib/collection/src/collection/payload_index_schema.rs b/lib/collection/src/collection/payload_index_schema.rs
+index 62be717d8..9fd79b194 100644
+--- a/lib/collection/src/collection/payload_index_schema.rs
++++ b/lib/collection/src/collection/payload_index_schema.rs
+@@ -3,13 +3,14 @@ use std::path::{Path, PathBuf};
+ 
+ use common::counter::hardware_accumulator::HwMeasurementAcc;
+ use segment::json_path::JsonPath;
+-use segment::problems::unindexed_field;
+ use segment::types::{Filter, PayloadFieldSchema, PayloadKeyType};
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::collection::Collection;
+ use crate::operations::types::{CollectionResult, UpdateResult};
++use crate::operations::universal_query::formula::ExpressionInternal;
+ use crate::operations::{CollectionUpdateOperations, CreateIndex, FieldIndexOperations};
++use crate::problems::unindexed_field;
+ use crate::save_on_disk::SaveOnDisk;
+ 
+ pub const PAYLOAD_INDEX_CONFIG_FILE: &str = "payload_index.json";
+@@ -103,21 +104,44 @@ impl Collection {
+         &self,
+         filter: &Filter,
+     ) -> Option<(JsonPath, Vec<PayloadFieldSchema>)> {
+-        self.payload_index_schema.read().one_unindexed_key(filter)
++        self.payload_index_schema
++            .read()
++            .one_unindexed_filter_key(filter)
+     }
++
++    pub fn one_unindexed_expression_key(
++        &self,
++        expr: &ExpressionInternal,
++    ) -> Option<(JsonPath, Vec<PayloadFieldSchema>)> {
++        self.payload_index_schema
++            .read()
++            .one_unindexed_expression_key(expr)
++    }
++}
++
++enum PotentiallyUnindexed<'a> {
++    Filter(&'a Filter),
++    Expression(&'a ExpressionInternal),
+ }
+ 
+ impl PayloadIndexSchema {
+     /// Returns an arbitrary payload key with acceptable schemas
+     /// used by `filter` which can be indexed but currently is not.
+     /// If this function returns `None` all indexable keys in `filter` are indexed.
+-    pub fn one_unindexed_key(
++    fn one_unindexed_key(
+         &self,
+-        filter: &Filter,
++        suspect: PotentiallyUnindexed<'_>,
+     ) -> Option<(JsonPath, Vec<PayloadFieldSchema>)> {
+         let mut extractor = unindexed_field::Extractor::new(&self.schema);
+ 
+-        extractor.update_from_filter_once(None, filter);
++        match suspect {
++            PotentiallyUnindexed::Filter(filter) => {
++                extractor.update_from_filter_once(None, filter);
++            }
++            PotentiallyUnindexed::Expression(expression) => {
++                extractor.update_from_expression(expression);
++            }
++        }
+ 
+         // Get the first unindexed field from the extractor.
+         extractor
+@@ -126,4 +150,21 @@ impl PayloadIndexSchema {
+             .next()
+             .map(|(key, schema)| (key.clone(), schema.clone()))
+     }
++
++    /// Returns an arbitrary payload key with acceptable schemas
++    /// used by `filter` which can be indexed but currently is not.
++    /// If this function returns `None` all indexable keys in `filter` are indexed.
++    pub fn one_unindexed_filter_key(
++        &self,
++        filter: &Filter,
++    ) -> Option<(JsonPath, Vec<PayloadFieldSchema>)> {
++        self.one_unindexed_key(PotentiallyUnindexed::Filter(filter))
++    }
++
++    pub fn one_unindexed_expression_key(
++        &self,
++        expr: &ExpressionInternal,
++    ) -> Option<(JsonPath, Vec<PayloadFieldSchema>)> {
++        self.one_unindexed_key(PotentiallyUnindexed::Expression(expr))
++    }
+ }
+diff --git a/lib/collection/src/collection/search.rs b/lib/collection/src/collection/search.rs
+index 94ec151fe..f651b9b5d 100644
+--- a/lib/collection/src/collection/search.rs
++++ b/lib/collection/src/collection/search.rs
+@@ -317,7 +317,7 @@ impl Collection {
+         duration: Duration,
+         filters: impl IntoIterator<Item = Option<&'a Filter>>,
+     ) {
+-        if duration > segment::problems::UnindexedField::slow_query_threshold() {
++        if duration > crate::problems::UnindexedField::slow_query_threshold() {
+             let filters = filters.into_iter().flatten().cloned().collect_vec();
+ 
+             let schema = self.payload_index_schema.read().schema.clone();
+diff --git a/lib/collection/src/lib.rs b/lib/collection/src/lib.rs
+index c36cc7b05..2845265b9 100644
+--- a/lib/collection/src/lib.rs
++++ b/lib/collection/src/lib.rs
+@@ -9,6 +9,7 @@ pub mod hash_ring;
+ pub mod lookup;
+ pub mod operations;
+ pub mod optimizers_builder;
++pub mod problems;
+ pub mod recommendations;
+ pub mod save_on_disk;
+ pub mod shards;
+diff --git a/lib/collection/src/operations/universal_query/formula.rs b/lib/collection/src/operations/universal_query/formula.rs
+index a52910001..c0bc9b24f 100644
+--- a/lib/collection/src/operations/universal_query/formula.rs
++++ b/lib/collection/src/operations/universal_query/formula.rs
+@@ -8,7 +8,7 @@ use segment::index::query_optimization::rescore_formula::parsed_formula::{
+     DatetimeExpression, DecayKind, ParsedExpression, ParsedFormula, PreciseScore, VariableId,
+ };
+ use segment::json_path::JsonPath;
+-use segment::types::{Condition, GeoPoint, PayloadKeyType};
++use segment::types::{Condition, GeoPoint};
+ use serde_json::Value;
+ 
+ use crate::operations::types::{CollectionError, CollectionResult};
+@@ -29,7 +29,7 @@ pub enum ExpressionInternal {
+         to: JsonPath,
+     },
+     Datetime(String),
+-    DatetimeKey(String),
++    DatetimeKey(JsonPath),
+     Mult(Vec<ExpressionInternal>),
+     Sum(Vec<ExpressionInternal>),
+     Neg(Box<ExpressionInternal>),
+@@ -87,10 +87,7 @@ impl ExpressionInternal {
+                         .map_err(|err: chrono::ParseError| err.to_string())?,
+                 ))
+             }
+-            ExpressionInternal::DatetimeKey(dt_key) => {
+-                let json_path: PayloadKeyType = dt_key
+-                    .parse()
+-                    .map_err(|_| format!("Invalid datetime payload variable: {dt_key}"))?;
++            ExpressionInternal::DatetimeKey(json_path) => {
+                 payload_vars.insert(json_path.clone());
+                 ParsedExpression::Datetime(DatetimeExpression::PayloadVariable(json_path))
+             }
+diff --git a/lib/collection/src/operations/universal_query/shard_query.rs b/lib/collection/src/operations/universal_query/shard_query.rs
+index a04800945..2e962c524 100644
+--- a/lib/collection/src/operations/universal_query/shard_query.rs
++++ b/lib/collection/src/operations/universal_query/shard_query.rs
+@@ -401,7 +401,12 @@ impl TryFrom<grpc::Expression> for ExpressionInternal {
+                 ExpressionInternal::GeoDistance { origin, to }
+             }
+             Variant::Datetime(dt_str) => ExpressionInternal::Datetime(dt_str),
+-            Variant::DatetimeKey(dt_key) => ExpressionInternal::DatetimeKey(dt_key),
++            Variant::DatetimeKey(dt_key) => {
++                let json_path = dt_key
++                    .parse()
++                    .map_err(|_| tonic::Status::invalid_argument("invalid payload key"))?;
++                ExpressionInternal::DatetimeKey(json_path)
++            }
+             Variant::Mult(grpc::MultExpression { mult }) => {
+                 let mult = mult
+                     .into_iter()
+diff --git a/lib/collection/src/operations/verification/query.rs b/lib/collection/src/operations/verification/query.rs
+index e8a6be18a..b2b112ea5 100644
+--- a/lib/collection/src/operations/verification/query.rs
++++ b/lib/collection/src/operations/verification/query.rs
+@@ -1,68 +1,63 @@
+-use api::rest::{Prefetch, QueryGroupsRequestInternal, QueryRequestInternal};
+ use segment::types::StrictModeConfig;
+ 
+ use super::StrictModeVerification;
+ use crate::collection::Collection;
++use crate::operations::types::{CollectionError, CollectionResult};
+ use crate::operations::universal_query::collection_query::{
+-    CollectionQueryGroupsRequest, CollectionQueryRequest,
++    CollectionPrefetch, CollectionQueryGroupsRequest, CollectionQueryRequest, Query,
+ };
+ 
+-impl StrictModeVerification for QueryRequestInternal {
+-    async fn check_custom(
++impl Query {
++    fn check_strict_mode(
+         &self,
+         collection: &Collection,
+         strict_mode_config: &StrictModeConfig,
+-    ) -> Result<(), crate::operations::types::CollectionError> {
+-        if let Some(prefetch) = &self.prefetch {
+-            for prefetch in prefetch {
+-                prefetch
+-                    .check_strict_mode(collection, strict_mode_config)
+-                    .await?;
++    ) -> CollectionResult<()> {
++        if strict_mode_config.unindexed_filtering_retrieve == Some(false) {
++            if let Query::Formula(formula) = self {
++                if let Some((key, schemas)) =
++                    collection.one_unindexed_expression_key(&formula.formula)
++                {
++                    let possible_schemas_str = schemas
++                        .iter()
++                        .map(|schema| schema.to_string())
++                        .collect::<Vec<_>>()
++                        .join(", ");
++
++                    return Err(CollectionError::strict_mode(
++                        format!(
++                            "Index required but not found for \"{key}\" of one of the following types: [{possible_schemas_str}]",
++                        ),
++                        "Create an index for this key or use a different formula expression.",
++                    ));
++                }
+             }
+         }
+-
+         Ok(())
+     }
+-
+-    fn query_limit(&self) -> Option<usize> {
+-        self.limit
+-    }
+-
+-    fn indexed_filter_read(&self) -> Option<&segment::types::Filter> {
+-        self.filter.as_ref()
+-    }
+-
+-    fn indexed_filter_write(&self) -> Option<&segment::types::Filter> {
+-        None
+-    }
+-
+-    fn request_exact(&self) -> Option<bool> {
+-        None
+-    }
+-
+-    fn request_search_params(&self) -> Option<&segment::types::SearchParams> {
+-        self.params.as_ref()
+-    }
+ }
+ 
+-impl StrictModeVerification for Prefetch {
++impl StrictModeVerification for CollectionQueryRequest {
+     async fn check_custom(
+         &self,
+         collection: &Collection,
+         strict_mode_config: &StrictModeConfig,
+-    ) -> Result<(), crate::operations::types::CollectionError> {
+-        // Prefetch.prefetch is of type Prefetch (recursive type)
+-        if let Some(prefetch) = &self.prefetch {
+-            for prefetch in prefetch {
+-                Box::pin(prefetch.check_strict_mode(collection, strict_mode_config)).await?;
+-            }
++    ) -> CollectionResult<()> {
++        // CollectionPrefetch.prefetch is of type CollectionPrefetch (recursive type)
++        for prefetch in &self.prefetch {
++            Box::pin(prefetch.check_strict_mode(collection, strict_mode_config)).await?;
++        }
++
++        if let Some(query) = self.query.as_ref() {
++            // check for unindexed fields in formula
++            query.check_strict_mode(collection, strict_mode_config)?
+         }
+ 
+         Ok(())
+     }
+ 
+     fn query_limit(&self) -> Option<usize> {
+-        self.limit
++        Some(self.limit)
+     }
+ 
+     fn indexed_filter_read(&self) -> Option<&segment::types::Filter> {
+@@ -82,29 +77,25 @@ impl StrictModeVerification for Prefetch {
+     }
+ }
+ 
+-impl StrictModeVerification for QueryGroupsRequestInternal {
+-    fn query_limit(&self) -> Option<usize> {
+-        self.group_request.limit
+-    }
+-
+-    fn indexed_filter_read(&self) -> Option<&segment::types::Filter> {
+-        self.filter.as_ref()
+-    }
+-
+-    fn indexed_filter_write(&self) -> Option<&segment::types::Filter> {
+-        None
+-    }
++impl StrictModeVerification for CollectionPrefetch {
++    async fn check_custom(
++        &self,
++        collection: &Collection,
++        strict_mode_config: &StrictModeConfig,
++    ) -> Result<(), crate::operations::types::CollectionError> {
++        // CollectionPrefetch.prefetch is of type CollectionPrefetch (recursive type)
++        for prefetch in &self.prefetch {
++            Box::pin(prefetch.check_strict_mode(collection, strict_mode_config)).await?;
++        }
+ 
+-    fn request_exact(&self) -> Option<bool> {
+-        None
+-    }
++        if let Some(query) = self.query.as_ref() {
++            // check for unindexed fields in formula
++            query.check_strict_mode(collection, strict_mode_config)?
++        }
+ 
+-    fn request_search_params(&self) -> Option<&segment::types::SearchParams> {
+-        self.params.as_ref()
++        Ok(())
+     }
+-}
+ 
+-impl StrictModeVerification for CollectionQueryRequest {
+     fn query_limit(&self) -> Option<usize> {
+         Some(self.limit)
+     }
+@@ -127,6 +118,18 @@ impl StrictModeVerification for CollectionQueryRequest {
+ }
+ 
+ impl StrictModeVerification for CollectionQueryGroupsRequest {
++    async fn check_custom(
++        &self,
++        collection: &Collection,
++        strict_mode_config: &StrictModeConfig,
++    ) -> CollectionResult<()> {
++        if let Some(query) = self.query.as_ref() {
++            // check for unindexed fields in formula
++            query.check_strict_mode(collection, strict_mode_config)?
++        }
++        Ok(())
++    }
++
+     fn query_limit(&self) -> Option<usize> {
+         Some(self.limit)
+     }
+diff --git a/lib/segment/src/problems/mod.rs b/lib/collection/src/problems/mod.rs
+similarity index 100%
+rename from lib/segment/src/problems/mod.rs
+rename to lib/collection/src/problems/mod.rs
+diff --git a/lib/segment/src/problems/unindexed_field.rs b/lib/collection/src/problems/unindexed_field.rs
+similarity index 74%
+rename from lib/segment/src/problems/unindexed_field.rs
+rename to lib/collection/src/problems/unindexed_field.rs
+index ae347cfbf..7bef01d68 100644
+--- a/lib/segment/src/problems/unindexed_field.rs
++++ b/lib/collection/src/problems/unindexed_field.rs
+@@ -7,15 +7,17 @@ use http::header::CONTENT_TYPE;
+ use http::{HeaderMap, HeaderValue, Method, Uri};
+ use issues::{Action, Code, ImmediateSolution, Issue, Solution};
+ use itertools::Itertools;
+-use strum::IntoEnumIterator as _;
+-
+-use crate::common::operation_error::OperationError;
+-use crate::data_types::index::{TextIndexParams, TextIndexType, TokenizerType};
+-use crate::json_path::JsonPath;
+-use crate::types::{
++use segment::common::operation_error::OperationError;
++use segment::data_types::index::{TextIndexParams, TextIndexType, TokenizerType};
++use segment::index::query_optimization::rescore_formula::parsed_formula::VariableId;
++use segment::json_path::JsonPath;
++use segment::types::{
+     AnyVariants, Condition, FieldCondition, Filter, Match, MatchValue, PayloadFieldSchema,
+     PayloadKeyType, PayloadSchemaParams, PayloadSchemaType, RangeInterface, UuidPayloadType,
+ };
++use strum::IntoEnumIterator as _;
++
++use crate::operations::universal_query::formula::ExpressionInternal;
+ #[derive(Debug)]
+ pub struct UnindexedField {
+     field_name: JsonPath,
+@@ -166,7 +168,7 @@ fn all_indexes() -> impl Iterator<Item = PayloadFieldSchema> {
+ 
+ fn infer_schema_from_match_value(value: &MatchValue) -> Vec<PayloadFieldSchema> {
+     match &value.value {
+-        crate::types::ValueVariants::String(string) => {
++        segment::types::ValueVariants::String(string) => {
+             let mut inferred = Vec::new();
+ 
+             if UuidPayloadType::parse_str(string).is_ok() {
+@@ -177,10 +179,10 @@ fn infer_schema_from_match_value(value: &MatchValue) -> Vec<PayloadFieldSchema>
+ 
+             inferred
+         }
+-        crate::types::ValueVariants::Integer(_integer) => {
++        segment::types::ValueVariants::Integer(_integer) => {
+             vec![PayloadFieldSchema::FieldType(PayloadSchemaType::Integer)]
+         }
+-        crate::types::ValueVariants::Bool(_boolean) => {
++        segment::types::ValueVariants::Bool(_boolean) => {
+             vec![PayloadFieldSchema::FieldType(PayloadSchemaType::Bool)]
+         }
+     }
+@@ -392,7 +394,16 @@ impl<'a> Extractor<'a> {
+ 
+         let full_key = JsonPath::extend_or_new(nested_prefix, key);
+ 
+-        let needs_index = match self.payload_schema.get(&full_key) {
++        if self.needs_index(&full_key, &inferred) {
++            self.unindexed_schema
++                .entry(full_key)
++                .or_default()
++                .extend(inferred);
++        }
++    }
++
++    fn needs_index(&self, key: &JsonPath, inferred: &[PayloadFieldSchema]) -> bool {
++        match self.payload_schema.get(key) {
+             Some(index_info) => {
+                 let index_info_kind = index_info.kind();
+ 
+@@ -416,11 +427,115 @@ impl<'a> Extractor<'a> {
+                 !already_indexed
+             }
+             None => true,
+-        };
++        }
++    }
++
++    pub fn update_from_expression(&mut self, expression: &ExpressionInternal) {
++        let key;
++        let inferred;
+ 
+-        if needs_index {
++        match expression {
++            ExpressionInternal::Constant(_) => return,
++            ExpressionInternal::Variable(variable) => {
++                // check if it is indexed with a numeric index
++                let Ok(var) = variable.parse::<VariableId>() else {
++                    // If it fails here, it will also fail when parsing.
++                    return;
++                };
++
++                match var {
++                    VariableId::Score(_) => return,
++                    VariableId::Payload(json_path) => {
++                        key = json_path;
++                        inferred = vec![
++                            PayloadFieldSchema::FieldType(PayloadSchemaType::Integer),
++                            PayloadFieldSchema::FieldType(PayloadSchemaType::Float),
++                        ];
++                    }
++                    VariableId::Condition(_) => return,
++                }
++            }
++            ExpressionInternal::Condition(condition) => {
++                self.update_from_condition(None, condition);
++                return;
++            }
++            ExpressionInternal::GeoDistance { origin: _, to } => {
++                key = to.clone();
++                inferred = vec![PayloadFieldSchema::FieldType(PayloadSchemaType::Geo)];
++            }
++            ExpressionInternal::Datetime(_) => return,
++            ExpressionInternal::DatetimeKey(variable) => {
++                key = variable.clone();
++                inferred = vec![PayloadFieldSchema::FieldType(PayloadSchemaType::Datetime)];
++            }
++            ExpressionInternal::Mult(expression_internals) => {
++                for expr in expression_internals {
++                    self.update_from_expression(expr);
++                }
++                return;
++            }
++            ExpressionInternal::Sum(expression_internals) => {
++                for expr in expression_internals {
++                    self.update_from_expression(expr);
++                }
++                return;
++            }
++            ExpressionInternal::Neg(expression_internal) => {
++                self.update_from_expression(expression_internal);
++                return;
++            }
++            ExpressionInternal::Div {
++                left,
++                right,
++                by_zero_default: _,
++            } => {
++                self.update_from_expression(left);
++                self.update_from_expression(right);
++                return;
++            }
++            ExpressionInternal::Sqrt(expression_internal) => {
++                self.update_from_expression(expression_internal);
++                return;
++            }
++            ExpressionInternal::Pow { base, exponent } => {
++                self.update_from_expression(base);
++                self.update_from_expression(exponent);
++                return;
++            }
++            ExpressionInternal::Exp(expression_internal) => {
++                self.update_from_expression(expression_internal);
++                return;
++            }
++            ExpressionInternal::Log10(expression_internal) => {
++                self.update_from_expression(expression_internal);
++                return;
++            }
++            ExpressionInternal::Ln(expression_internal) => {
++                self.update_from_expression(expression_internal);
++                return;
++            }
++            ExpressionInternal::Abs(expression_internal) => {
++                self.update_from_expression(expression_internal);
++                return;
++            }
++            ExpressionInternal::Decay {
++                kind: _,
++                x,
++                target,
++                midpoint: _,
++                scale: _,
++            } => {
++                self.update_from_expression(x);
++                if let Some(t) = target.as_ref() {
++                    self.update_from_expression(t)
++                };
++                return;
++            }
++        }
++
++        if self.needs_index(&key, &inferred) {
+             self.unindexed_schema
+-                .entry(full_key)
++                .entry(key)
+                 .or_default()
+                 .extend(inferred);
+         }
+diff --git a/lib/collection/src/tests/payload.rs b/lib/collection/src/tests/payload.rs
+index 05c79209c..a3c6d92b0 100644
+--- a/lib/collection/src/tests/payload.rs
++++ b/lib/collection/src/tests/payload.rs
+@@ -69,7 +69,7 @@ async fn test_payload_missing_index_check() {
+         shard
+             .payload_index_schema
+             .read()
+-            .one_unindexed_key(&geo_filter)
++            .one_unindexed_filter_key(&geo_filter)
+             .map(|(x, _)| x),
+         Some(JsonPath::from_str("location").unwrap())
+     );
+@@ -88,7 +88,7 @@ async fn test_payload_missing_index_check() {
+         shard
+             .payload_index_schema
+             .read()
+-            .one_unindexed_key(&geo_filter),
++            .one_unindexed_filter_key(&geo_filter),
+         None
+     );
+ 
+@@ -111,7 +111,7 @@ async fn test_payload_missing_index_check() {
+         shard
+             .payload_index_schema
+             .read()
+-            .one_unindexed_key(&num_filter)
++            .one_unindexed_filter_key(&num_filter)
+             .map(|(x, _)| x),
+         Some("location.lat".parse().unwrap())
+     );
+@@ -130,7 +130,7 @@ async fn test_payload_missing_index_check() {
+         shard
+             .payload_index_schema
+             .read()
+-            .one_unindexed_key(&num_filter),
++            .one_unindexed_filter_key(&num_filter),
+         None,
+     );
+ 
+@@ -140,7 +140,7 @@ async fn test_payload_missing_index_check() {
+         shard
+             .payload_index_schema
+             .read()
+-            .one_unindexed_key(&combined_filter),
++            .one_unindexed_filter_key(&combined_filter),
+         None,
+     );
+ }
+diff --git a/lib/segment/Cargo.toml b/lib/segment/Cargo.toml
+index 0169df766..0c81981b8 100644
+--- a/lib/segment/Cargo.toml
++++ b/lib/segment/Cargo.toml
+@@ -88,7 +88,6 @@ smol_str = { version = "0.3.2", default-features = false, features = ["serde"] }
+ fnv = { workspace = true }
+ indexmap = { workspace = true }
+ ahash = { workspace = true }
+-http = { workspace = true }
+ self_cell = "1.1.0"
+ sha2 = { workspace = true }
+ smallvec = "1.14.0"
+diff --git a/lib/segment/src/lib.rs b/lib/segment/src/lib.rs
+index 16ab9e66f..312cd658f 100644
+--- a/lib/segment/src/lib.rs
++++ b/lib/segment/src/lib.rs
+@@ -5,7 +5,6 @@ pub mod fixtures;
+ pub mod id_tracker;
+ pub mod index;
+ pub mod payload_storage;
+-pub mod problems;
+ pub mod rocksdb_backup;
+ pub mod segment;
+ pub mod segment_constructor;
+diff --git a/lib/storage/src/issues_subscribers.rs b/lib/storage/src/issues_subscribers.rs
+index cf5041258..65ce4783e 100644
+--- a/lib/storage/src/issues_subscribers.rs
++++ b/lib/storage/src/issues_subscribers.rs
+@@ -1,9 +1,9 @@
+ use std::sync::Arc;
+ 
+ use collection::events::{CollectionDeletedEvent, IndexCreatedEvent, SlowQueryEvent};
++use collection::problems::UnindexedField;
+ use issues::Code;
+ use issues::broker::Subscriber;
+-use segment::problems::UnindexedField;
+ 
+ #[derive(Clone, Copy)]
+ pub struct UnindexedFieldSubscriber;
+@@ -15,7 +15,7 @@ impl Subscriber<SlowQueryEvent> for UnindexedFieldSubscriber {
+         }
+ 
+         for filter in &event.filters {
+-            segment::problems::UnindexedField::submit_possible_suspects(
++            collection::problems::UnindexedField::submit_possible_suspects(
+                 filter,
+                 &event.schema,
+                 event.collection_id.clone(),
+diff --git a/src/actix/api/query_api.rs b/src/actix/api/query_api.rs
+index 417682d96..58c9dbe9f 100644
+--- a/src/actix/api/query_api.rs
++++ b/src/actix/api/query_api.rs
+@@ -13,7 +13,7 @@ use tokio::time::Instant;
+ use super::CollectionPath;
+ use super::read_params::ReadParams;
+ use crate::actix::auth::ActixAccess;
+-use crate::actix::helpers::{self, get_request_hardware_counter, process_response_error};
++use crate::actix::helpers::{self, get_request_hardware_counter};
+ use crate::common::inference::InferenceToken;
+ use crate::common::inference::query_requests_rest::{
+     convert_query_groups_request_from_rest, convert_query_request_from_rest,
+@@ -36,19 +36,6 @@ async fn query_points(
+         shard_key,
+     } = request.into_inner();
+ 
+-    let pass = match check_strict_mode(
+-        &query_request,
+-        params.timeout_as_secs(),
+-        &collection.name,
+-        &dispatcher,
+-        &access,
+-    )
+-    .await
+-    {
+-        Ok(pass) => pass,
+-        Err(err) => return process_response_error(err, Instant::now(), None),
+-    };
+-
+     let request_hw_counter = get_request_hardware_counter(
+         &dispatcher,
+         collection.name.clone(),
+@@ -65,6 +52,15 @@ async fn query_points(
+     let result = async move {
+         let request = convert_query_request_from_rest(query_request, &inference_token).await?;
+ 
++        let pass = check_strict_mode(
++            &request,
++            params.timeout_as_secs(),
++            &collection.name,
++            &dispatcher,
++            &access,
++        )
++        .await?;
++
+         let points = dispatcher
+             .toc(&access, &pass)
+             .query_batch(
+@@ -103,19 +99,6 @@ async fn query_points_batch(
+ ) -> impl Responder {
+     let QueryRequestBatch { searches } = request.into_inner();
+ 
+-    let pass = match check_strict_mode_batch(
+-        searches.iter().map(|i| &i.internal),
+-        params.timeout_as_secs(),
+-        &collection.name,
+-        &dispatcher,
+-        &access,
+-    )
+-    .await
+-    {
+-        Ok(pass) => pass,
+-        Err(err) => return process_response_error(err, Instant::now(), None),
+-    };
+-
+     let request_hw_counter = get_request_hardware_counter(
+         &dispatcher,
+         collection.name.clone(),
+@@ -142,6 +125,15 @@ async fn query_points_batch(
+             batch.push((request, shard_selection));
+         }
+ 
++        let pass = check_strict_mode_batch(
++            batch.iter().map(|i| &i.0),
++            params.timeout_as_secs(),
++            &collection.name,
++            &dispatcher,
++            &access,
++        )
++        .await?;
++
+         let res = dispatcher
+             .toc(&access, &pass)
+             .query_batch(
+@@ -183,19 +175,6 @@ async fn query_points_groups(
+         shard_key,
+     } = request.into_inner();
+ 
+-    let pass = match check_strict_mode(
+-        &search_group_request,
+-        params.timeout_as_secs(),
+-        &collection.name,
+-        &dispatcher,
+-        &access,
+-    )
+-    .await
+-    {
+-        Ok(pass) => pass,
+-        Err(err) => return process_response_error(err, Instant::now(), None),
+-    };
+-
+     let request_hw_counter = get_request_hardware_counter(
+         &dispatcher,
+         collection.name.clone(),
+@@ -213,6 +192,15 @@ async fn query_points_groups(
+         let query_group_request =
+             convert_query_groups_request_from_rest(search_group_request, inference_token).await?;
+ 
++        let pass = check_strict_mode(
++            &query_group_request,
++            params.timeout_as_secs(),
++            &collection.name,
++            &dispatcher,
++            &access,
++        )
++        .await?;
++
+         do_query_point_groups(
+             dispatcher.toc(&access, &pass),
+             &collection.name,
+diff --git a/src/issues_setup.rs b/src/issues_setup.rs
+index 09779bd08..9a17de28e 100644
+--- a/src/issues_setup.rs
++++ b/src/issues_setup.rs
+@@ -1,7 +1,7 @@
+ use std::time::Duration;
+ 
+ use collection::events::{CollectionDeletedEvent, IndexCreatedEvent, SlowQueryEvent};
+-use segment::problems::unindexed_field;
++use collection::problems::unindexed_field;
+ use storage::issues_subscribers::UnindexedFieldSubscriber;
+ 
+ use crate::settings::Settings;
+diff --git a/tests/openapi/test_strictmode.py b/tests/openapi/test_strictmode.py
+index eebf2bb35..b35985ff1 100644
+--- a/tests/openapi/test_strictmode.py
++++ b/tests/openapi/test_strictmode.py
+@@ -1323,6 +1323,46 @@ def test_filter_nested_condition(collection_name):
+     assert not search_fail.ok
+ 
+ 
++def test_strict_mode_formula_expression(collection_name):
++
++    def query_request():
++        expression = {
++            "sum": [
++                "discount_price",
++                "$score",
++            ]
++        }
++
++        return request_with_validation(
++            api='/collections/{collection_name}/points/query',
++            method="POST",
++            path_params={'collection_name': collection_name},
++            body={
++                "prefetch": {
++                    "query": [0.1, 0.2, 0.3, 0.4],
++                },
++                "query": {
++                    "formula": expression,
++                    "defaults": { "discount_price": 0 } # Even with default, it should still be restricted
++                }
++            }
++        )
++    # No restriction, query succeeds
++    query_ok = query_request()
++    assert query_ok.ok
++
++    set_strict_mode(collection_name, {
++        "enabled": True,
++        "unindexed_filtering_retrieve": False,
++    })
++
++    # Now it should fail
++    query_fail = query_request()
++    assert not query_fail.ok
++    assert "discount_price" in query_fail.json()['status']['error']
++    assert "formula expression" in query_fail.json()['status']['error']
++
++
+ def test_strict_mode_read_rate_limiting_small_replenish(collection_name):
+     """
+     If our read rate limit capacity is larger, test that when exhausting it
+-- 
+2.39.5 (Apple Git-154)
+

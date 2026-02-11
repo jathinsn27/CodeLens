@@ -165,7 +165,7 @@ async def openai_chat_completions(request: ChatCompletionRequest):
 async def search(
     q: str = Query(..., description="Search query"),
     limit: int = Query(20, ge=1, le=100),
-    source_type: str = Query(None, description="Filter by source: jira, slack, person, feature"),
+    source_type: str = Query(None, description="Filter by source: jira, slack, person, feature, patch"),
     feature_id: str = Query(None, description="Filter by feature ID"),
 ):
     """
@@ -288,7 +288,7 @@ async def ask(
     
     # Generate answer with LLM
     t1 = time.time()
-    system_prompt = """You are a feature intelligence analyst. Synthesize Jira tickets, Slack messages, and docs into a clear, structured answer.
+    system_prompt = """You are a feature intelligence analyst and code expert. Synthesize Jira tickets, Slack messages, documentation, and git patches/diffs into a clear, structured answer.
 
 STRICT FORMAT RULES — follow this exact markdown structure:
 
@@ -300,6 +300,10 @@ One sentence answering the question directly.
 - Bullet point 2
 - Bullet point 3
 
+### Code Changes
+- **file_name** — brief description of change (from patches)
+- If no code changes found, say "No code changes indexed."
+
 ### People Involved
 - **person_name** — what they did
 
@@ -308,11 +312,12 @@ One sentence answering the question directly.
 
 ### References
 - JIRA-XXXX, relevant ticket IDs
+- Commit hashes (if applicable)
 
 RULES:
-- Be concise. No filler. Max 150 words total.
+- Be concise. No filler.
 - Use ONLY the context provided. If info is missing, say "Not enough context."
-- Always use the markdown headers above. Skip a section if no relevant info."""
+- Always use the markdown headers above. Skip a section if no relevant info (except Code Changes - always include that if asked about code)."""
 
     user_prompt = f"""Question: {q}
 
