@@ -23,3 +23,5 @@ models/
 # Cognee local data
 cognee_data/
 *.log
+
+venv/

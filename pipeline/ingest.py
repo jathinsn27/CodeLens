@@ -242,6 +242,109 @@ def ingest_feature(client: QdrantClient, json_path: Path):
     print(f"Done! Collection now has {client.count(COLLECTION_NAME).count} points.")
 
 
+
+import re
+
+def parse_patch(patch_content: str) -> dict:
+    """Parse a git patch file to extract metadata and diff."""
+    # Extract headers
+    commit_match = re.search(r"^From (\w+)", patch_content)
+    author_match = re.search(r"^From: (.*)", patch_content, re.MULTILINE)
+    date_match = re.search(r"^Date: (.*)", patch_content, re.MULTILINE)
+    subject_match = re.search(r"^Subject: (.*)", patch_content, re.MULTILINE)
+    
+    # Extract message (between Subject and ---)
+    message_match = re.search(r"^Subject: .*?\n\n(.*?)\n---", patch_content, re.DOTALL | re.MULTILINE)
+    
+    # Extract diff stats/files
+    # This usually appears after --- and before the first diff --git
+    stat_match = re.search(r"\n---\n(.*?)\n\s\d+ files? changed", patch_content, re.DOTALL)
+    
+    # Extract diff (everything after the first diff --git or just the end)
+    diff_start = patch_content.find("\ndiff --git")
+    diff_content = patch_content[diff_start:] if diff_start != -1 else ""
+    
+    return {
+        "commit": commit_match.group(1) if commit_match else "unknown",
+        "author": author_match.group(1).strip() if author_match else "unknown",
+        "date": date_match.group(1).strip() if date_match else "unknown",
+        "subject": subject_match.group(1).strip() if subject_match else "unknown",
+        "message": message_match.group(1).strip() if message_match else "",
+        "files_stat": stat_match.group(1).strip() if stat_match else "",
+        "diff": diff_content.strip(),
+    }
+
+
+def format_patch_document(patch_data: dict, filename: str, feature_id: str) -> dict:
+    """Format a patch as a document."""
+    text = f"""Commit: {patch_data['commit']}
+Author: {patch_data['author']}
+Date: {patch_data['date']}
+Subject: {patch_data['subject']}
+
+Message:
+{patch_data['message']}
+
+Files Changed:
+{patch_data['files_stat']}
+
+Diff Summary:
+{patch_data['diff'][:1000]}"""  # Truncate diff to avoid hitting token limits
+
+    return {
+        "id": str(uuid.uuid4()),
+        "text": text,
+        "source_type": "patch",
+        "source_id": patch_data["commit"],
+        "feature_id": feature_id,
+        "title": patch_data["subject"],
+        "timestamp": patch_data["date"],
+        "author": patch_data["author"],
+        "entity_type": "patch",
+        "filename": filename,
+    }
+
+
+def ingest_patch(client: QdrantClient, patch_path: Path, known_features: list):
+    """Ingest a single patch file."""
+    print(f"\nIngesting Patch: {patch_path.name}")
+    
+    try:
+        content = patch_path.read_text(encoding="utf-8")
+        parsed = parse_patch(content)
+        
+        # Try to guess feature_id from filename or content matching known features
+        # Simple heuristic: if feature name part is in patch filename
+        feature_id = "unknown"
+        for fid in known_features:
+            # simple keyword matching - split by _ or -
+            keywords = fid.replace("_", " ").replace("-", " ").split()
+            if any(k.lower() in patch_path.name.lower() for k in keywords if len(k) > 3):
+                feature_id = fid
+                break
+        
+        doc = format_patch_document(parsed, patch_path.name, feature_id)
+        print(f"  + Commit: {doc['source_id'][:8]} - {doc['title'][:50]}... (Feature: {feature_id})")
+        
+        # Embed
+        vector = get_embedding(doc["text"])
+        
+        # Store text in payload
+        # doc["text"] is already in doc
+        
+        point = PointStruct(
+            id=doc["id"],
+            vector=vector,
+            payload=doc,
+        )
+        
+        client.upsert(collection_name=COLLECTION_NAME, points=[point])
+        print(f"  Upserted patch document.")
+        
+    except Exception as e:
+        print(f"  Error ingesting patch {patch_path.name}: {e}")
+
+
 def main():
     """Main ingestion entry point."""
     print("=" * 60)
@@ -261,15 +364,27 @@ def main():
     
     # Find all feature JSON files
     json_files = list(DATA_DIR.glob("*.json"))
-    if not json_files:
-        print(f"\nNo JSON files found in {DATA_DIR}")
+    patch_files = list(DATA_DIR.glob("*.patch"))
+    
+    if not json_files and not patch_files:
+        print(f"\nNo data files found in {DATA_DIR}")
         return
     
-    print(f"\nFound {len(json_files)} feature file(s)")
+    print(f"\nFound {len(json_files)} feature file(s) and {len(patch_files)} patch file(s)")
+    
+    # Keep track of known feature IDs to help link patches
+    known_features = []
     
     # Ingest each feature
     for json_path in json_files:
+        data = load_feature_data(json_path)
+        if "metadata" in data and "dataset_name" in data["metadata"]:
+            known_features.append(data["metadata"]["dataset_name"])
         ingest_feature(client, json_path)
+        
+    # Ingest patches
+    for patch_path in patch_files:
+        ingest_patch(client, patch_path, known_features)
     
     print("\n" + "=" * 60)
     print("Ingestion complete!")
