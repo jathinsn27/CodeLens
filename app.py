@@ -232,9 +232,9 @@ async def search(
 
 @app.get("/api/ask")
 async def ask(
-    q: str = Query(..., description="Question to answer"),
+    q: str = Query(..., description="The query/question"),
+    limit: int = Query(12, ge=1, le=50),
     feature_id: str = Query(None, description="Filter by feature ID"),
-    limit: int = Query(8, ge=1, le=20),
 ):
     """
     RAG Q&A: retrieve context from Qdrant, synthesize answer via local LLM.
@@ -268,7 +268,7 @@ async def ask(
     sources = []
     for point in results.points:
         payload = point.payload or {}
-        text = payload.get("text", "")[:800]
+        text = payload.get("text", "")[:1500]
         source_type = payload.get("source_type", "unknown")
         source_id = payload.get("source_id", "")
         
@@ -377,6 +377,15 @@ async def timeline(
         with_payload=True,
     )[0]
     
+    # Get patches
+    filter_conditions[0] = FieldCondition(key="entity_type", match=MatchValue(value="patch"))
+    patches = qdrant.scroll(
+        collection_name=COLLECTION_NAME,
+        scroll_filter=Filter(must=filter_conditions),
+        limit=limit,
+        with_payload=True,
+    )[0]
+    
     # Combine and format
     events = []
     
@@ -402,6 +411,18 @@ async def timeline(
             "channel": payload.get("channel", ""),
             "timestamp": payload.get("timestamp", ""),
             "text": payload.get("message_text", "")[:200],
+        })
+
+    for point in patches:
+        payload = point.payload or {}
+        events.append({
+            "id": str(point.id),
+            "type": "patch",
+            "source_id": payload.get("source_id", ""),
+            "author": payload.get("author", ""),
+            "title": payload.get("title", ""),
+            "timestamp": payload.get("timestamp", ""),
+            "text": payload.get("text", "")[:200],
         })
     
     # Sort by timestamp
@@ -1240,6 +1261,7 @@ def get_frontend_html() -> str:
         }
         .tl-pip.jira { background: var(--accent); }
         .tl-pip.slack { background: var(--green); }
+        .tl-pip.patch { background: var(--amber); }
         .tl-body { min-width: 0; }
         .tl-date { font-size: 0.6875rem; color: var(--text-muted); }
         .tl-label {
@@ -1253,6 +1275,7 @@ def get_frontend_html() -> str:
         }
         .tl-tag.jira { background: var(--accent-subtle); color: var(--accent); }
         .tl-tag.slack { background: var(--green-subtle); color: var(--green); }
+        .tl-tag.patch { background: var(--amber-subtle); color: var(--amber); }
         .tl-text {
             font-size: 0.6875rem; color: var(--text-secondary);
             margin-top: 0.125rem; line-height: 1.4;
@@ -1286,6 +1309,7 @@ def get_frontend_html() -> str:
         }
         .tl-preview-tag.jira { background: var(--accent-subtle); color: var(--accent); }
         .tl-preview-tag.slack { background: var(--green-subtle); color: var(--green); }
+        .tl-preview-tag.patch { background: var(--amber-subtle); color: var(--amber); }
         .tl-preview-title {
             font-size: 0.8125rem; font-weight: 600; color: var(--text-primary);
             margin-bottom: 0.25rem; line-height: 1.3;
@@ -1712,8 +1736,12 @@ def get_frontend_html() -> str:
 
                 let html = '<h3>Search Results</h3><p>Found ' + data.total + ' documents (' + data.time_ms + 'ms)</p>';
                 data.results.forEach(r => {
-                    const tag = r.source_type === 'jira' ? '<span class="tl-tag jira" style="display:inline-block;margin-right:6px">JIRA</span>' : '<span class="tl-tag slack" style="display:inline-block;margin-right:6px">SLACK</span>';
-                    html += '<div style="padding:0.5rem 0;border-bottom:1px solid var(--border)">' + tag + '<strong>' + (r.title||r.source_id) + '</strong><br><span style="font-size:0.75rem;color:var(--text-muted)">' + (r.user||'') + ' &middot; ' + fmt(r.timestamp) + ' &middot; score: ' + (r.score||0).toFixed(3) + '</span><br><span style="font-size:0.8125rem;color:var(--text-secondary)">' + (r.text||'').substring(0,200) + '</span></div>';
+                    let tag = '';
+                    if (r.source_type === 'jira') tag = '<span class="tl-tag jira" style="display:inline-block;margin-right:6px">JIRA</span>';
+                    else if (r.source_type === 'slack') tag = '<span class="tl-tag slack" style="display:inline-block;margin-right:6px">SLACK</span>';
+                    else if (r.source_type === 'patch') tag = '<span class="tl-tag patch" style="display:inline-block;margin-right:6px">PATCH</span>';
+                    
+                    html += '<div style="padding:0.5rem 0;border-bottom:1px solid var(--border)">' + tag + '<strong>' + (r.title||r.source_id) + '</strong><br><span style="font-size:0.75rem;color:var(--text-muted)">' + (r.user||r.author||'') + ' &middot; ' + fmt(r.timestamp) + ' &middot; score: ' + (r.score||0).toFixed(3) + '</span><br><span style="font-size:0.8125rem;color:var(--text-secondary)">' + (r.text||'').substring(0,200) + '</span></div>';
                 });
                 appendMsg('assistant', html);
             } catch (err) {
@@ -1765,9 +1793,12 @@ def get_frontend_html() -> str:
             const body = document.getElementById('tlPreviewBody');
 
             tag.className = 'tl-preview-tag ' + e.type;
-            tag.textContent = e.type === 'jira' ? (e.source_id || 'JIRA') : '#' + (e.channel || 'slack');
+            if (e.type === 'jira') tag.textContent = e.source_id || 'JIRA';
+            else if (e.type === 'slack') tag.textContent = '#' + (e.channel || 'slack');
+            else if (e.type === 'patch') tag.textContent = 'COMMIT: ' + (e.source_id || 'patch').substring(0,8);
+            
             title.textContent = e.title || e.text || '';
-            meta.textContent = (e.user ? e.user + ' · ' : '') + fmt(e.timestamp) + (e.status ? ' · ' + e.status : '');
+            meta.textContent = (e.user ? e.user + ' · ' : (e.author ? e.author + ' · ' : '')) + fmt(e.timestamp) + (e.status ? ' · ' + e.status : '');
             body.textContent = e.text || e.title || '';
 
             const rect = ev.currentTarget.getBoundingClientRect();
